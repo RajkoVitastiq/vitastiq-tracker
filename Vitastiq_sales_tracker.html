@@ -572,7 +572,7 @@ tr:hover td { background: rgba(255,255,255,0.02); }
     </div>
     <div class="form-group" id="g-model"><div class="form-label">Model</div>
       <select class="form-input" id="m-model" onchange="onModelChange()">
-        <option>Vitastiq PRO</option><option>Vitastiq Family</option>
+        <option>Vitastiq PRO</option><option>Vitastiq Family</option><option>Vitastiq 2</option>
       </select>
     </div>
     <div class="form-group" id="g-deviceqty"><div class="form-label">Device Qty</div><input class="form-input" type="number" id="m-dqty" value="1" min="0" step="1" oninput="calcModal()"></div>
@@ -583,6 +583,13 @@ tr:hover td { background: rgba(255,255,255,0.02); }
     <div class="form-group">
       <div class="form-label">VAT %</div>
       <input class="form-input" type="number" id="m-vat" value="0" step="1" oninput="calcModal()">
+    </div>
+    <div class="form-group" id="g-vat-mode">
+      <div class="form-label">VAT Mode</div>
+      <select class="form-input" id="m-vat-mode" onchange="calcModal()">
+        <option value="added">Added on top</option>
+        <option value="included">Included in price</option>
+      </select>
     </div>
     <div class="form-group" id="g-shipping-mode">
       <div class="form-label" id="ship-label">Shipping</div>
@@ -632,8 +639,8 @@ let GSHEET_URL = 'https://script.google.com/macros/s/AKfycbzuP2o731zyPb3-gPatLjj
 
 let extraSales = [];
 let deletedSeedIds = new Set();
-let cogsDefaults = {'Vitastiq PRO': 50, 'Vitastiq Family': 50};
-let priceDefaults = {'Vitastiq PRO': 498, 'Vitastiq Family': 258};
+let cogsDefaults = {'Vitastiq PRO': 50, 'Vitastiq Family': 50, 'Vitastiq 2': 50};
+let priceDefaults = {'Vitastiq PRO': 498, 'Vitastiq Family': 258, 'Vitastiq 2': 218};
 let currentYear = 2026;
 let editId = null;
 let charts = {};
@@ -673,6 +680,20 @@ function jsonpGet(url) {
 async function gsGet(key) {
   if (!GSHEET_URL) return null;
   try {
+    // Check if stored in chunks
+    const countUrl = GSHEET_URL + '?key=' + encodeURIComponent(key + '_count');
+    const countD = await jsonpGet(countUrl);
+    const count = countD && countD.value ? parseInt(countD.value) : 0;
+    if (count > 1) {
+      let assembled = '';
+      for (let i = 0; i < count; i++) {
+        const chunkUrl = GSHEET_URL + '?key=' + encodeURIComponent(key + '_' + i);
+        const chunkD = await jsonpGet(chunkUrl);
+        assembled += (chunkD && chunkD.value) ? chunkD.value : '';
+      }
+      return assembled ? decodeURIComponent(assembled) : null;
+    }
+    // Single value
     const url = GSHEET_URL + '?key=' + encodeURIComponent(key);
     const d = await jsonpGet(url);
     if (!d) return null;
@@ -686,8 +707,25 @@ async function gsSet(key, value) {
   // Also push to Google Sheets via JSONP GET with encoded value
   if (!GSHEET_URL) return;
   try {
-    const url = GSHEET_URL + '?action=set&key=' + encodeURIComponent(key) + '&value=' + encodeURIComponent(value);
-    await jsonpGet(url);
+    // Split large values into chunks if needed (URL limit ~2000 chars)
+    const encoded = encodeURIComponent(value);
+    if (encoded.length > 1800) {
+      // Store in chunks: key_0, key_1, key_2... and key_count
+      const chunkSize = 1800;
+      const chunks = [];
+      for (let i = 0; i < encoded.length; i += chunkSize) {
+        chunks.push(encoded.slice(i, i + chunkSize));
+      }
+      // Store chunk count
+      await jsonpGet(GSHEET_URL + '?action=set&key=' + encodeURIComponent(key + '_count') + '&value=' + chunks.length);
+      // Store each chunk
+      for (let i = 0; i < chunks.length; i++) {
+        await jsonpGet(GSHEET_URL + '?action=set&key=' + encodeURIComponent(key + '_' + i) + '&value=' + chunks[i]);
+      }
+    } else {
+      const url = GSHEET_URL + '?action=set&key=' + encodeURIComponent(key) + '&value=' + encodeURIComponent(value);
+      await jsonpGet(url);
+    }
   } catch(e) {}
 }
 
@@ -1165,25 +1203,47 @@ function calcModal() {
   const cogs = parseFloat(document.getElementById('m-cogs').value)||0;
   const shipMode = document.getElementById('m-ship-mode').value;
   const shipIncluded = shipMode === 'included';
+  const vatMode = document.getElementById('m-vat-mode')?.value || 'added';
+  const vatIncluded = vatMode === 'included';
 
   let totalInvoice, totalVat, totalShip, totalNetRevenue, totalGrossProfit;
   const totalShipCost = ship; // shipping cost (may or may not be on invoice)
 
   if (!shipIncluded) {
-    // ADDED ON TOP: VAT is on (price + ship)
-    const base = dprice + ship;                  // e.g. 498 + 50 = 548
-    totalVat = base * vat / 100;                 // 548 × 21% = 115.08
-    totalInvoice = dprice * dqty + ship + totalVat * dqty; // (price × qty) + ship (once) + VAT
-    totalShip = ship;                            // shipping is per order, not per unit
-    totalNetRevenue = dprice * dqty;             // 498 × qty (price excl. ship & VAT)
-    totalGrossProfit = totalNetRevenue - cogs;   // 498 × qty - COGS
+    if (!vatIncluded) {
+      // Ship added, VAT added on (price + ship)
+      const base = dprice + ship;
+      totalVat = base * vat / 100;
+      totalInvoice = dprice * dqty + ship + totalVat * dqty;
+      totalShip = ship;
+      totalNetRevenue = dprice * dqty;
+      totalGrossProfit = totalNetRevenue - cogs;
+    } else {
+      // Ship added, VAT extracted from price
+      const netPerUnit = vat > 0 ? dprice / (1 + vat / 100) : dprice;
+      totalVat = (dprice - netPerUnit) * dqty;
+      totalShip = ship;
+      totalInvoice = dprice * dqty + ship;
+      totalNetRevenue = netPerUnit * dqty;
+      totalGrossProfit = totalNetRevenue - cogs;
+    }
   } else {
-    // INCLUDED IN PRICE: VAT is on price only, ship already embedded
-    totalVat = dprice * vat / 100;               // 498 × 21% = 104.58
-    totalInvoice = (dprice + totalVat) * dqty;   // 602.58 × qty
-    totalShip = ship;                            // shipping cost (not on invoice)
-    totalNetRevenue = (dprice - ship) * dqty;    // (498 - 50) × qty = 448
-    totalGrossProfit = totalNetRevenue - cogs;   // 448 - COGS
+    if (!vatIncluded) {
+      // Ship included in price, VAT added on top of price
+      totalVat = dprice * vat / 100;
+      totalInvoice = (dprice + totalVat) * dqty;
+      totalShip = ship;
+      totalNetRevenue = (dprice - ship) * dqty;
+      totalGrossProfit = totalNetRevenue - cogs;
+    } else {
+      // Both ship and VAT included in price
+      const netPerUnit = vat > 0 ? dprice / (1 + vat / 100) : dprice;
+      totalVat = (dprice - netPerUnit) * dqty;
+      totalShip = ship;
+      totalInvoice = dprice * dqty;
+      totalNetRevenue = (netPerUnit - ship) * dqty;
+      totalGrossProfit = totalNetRevenue - cogs;
+    }
   }
 
   const priceLabel2 = document.getElementById('price-label');
@@ -1193,8 +1253,8 @@ function calcModal() {
 
   document.getElementById('calc-preview').innerHTML = `
     <div class="calc-row"><span>Device price/unit</span><span>${eur(dprice)}</span></div>
-    ${!shipIncluded ? `<div class="calc-row"><span>Shipping (added, on invoice)</span><span>+ ${eur(ship)}</span></div>` : `<div class="calc-row"><span>Shipping (included in price, our cost)</span><span style="color:var(--text3)">€ ${num(ship)} embedded</span></div>`}
-    <div class="calc-row"><span>VAT (${vat}%) on ${shipIncluded ? 'device price' : 'price + ship'}</span><span>+ ${eur(totalVat)}</span></div>
+    ${!shipIncluded ? `<div class="calc-row"><span>Shipping (added on top)</span><span>+ ${eur(ship)}</span></div>` : `<div class="calc-row"><span>Shipping (included in price)</span><span style="color:var(--text3)">€ ${num(ship)}</span></div>`}
+    <div class="calc-row"><span>VAT (${vat}%) ${vatIncluded ? '← extracted from price' : '← added on top'}</span><span>${vatIncluded ? '': '+ '}${eur(totalVat)}</span></div>
     <div class="calc-row" style="border-top:1px solid var(--border2);margin-top:4px;padding-top:6px;font-weight:500"><span>Total Invoice</span><span>${eur(totalInvoice)}</span></div>
     <div class="calc-row"><span>– VAT</span><span style="color:var(--text3)">– ${eur(totalVat)}</span></div>
     <div class="calc-row"><span>– Shipping${shipIncluded?' (our cost)':' (on invoice)'}</span><span style="color:var(--text3)">– ${eur(totalShip)}</span></div>
@@ -1279,19 +1339,39 @@ async function saveEntry() {
     // INCLUDED:     VAT on price; net = (price - ship) × qty; GP = net - COGS
     let totalInvoice, totalVat, totalShip, totalNetRevenue, grossProfit;
 
+    const vatMode2 = document.getElementById('m-vat-mode')?.value || 'added';
+    const vatIncluded2 = vatMode2 === 'included';
     if (!shipIncluded) {
-      const base = dprice + ship;
-      totalVat = base * vat / 100 * dqty;
-      totalInvoice = dprice * dqty + ship + (base * vat / 100) * dqty;
-      totalShip = ship;
-      totalNetRevenue = dprice * dqty;
-      grossProfit = totalNetRevenue - cogs;
+      if (!vatIncluded2) {
+        const base = dprice + ship;
+        totalVat = base * vat / 100 * dqty;
+        totalInvoice = dprice * dqty + ship + (base * vat / 100) * dqty;
+        totalShip = ship;
+        totalNetRevenue = dprice * dqty;
+        grossProfit = totalNetRevenue - cogs;
+      } else {
+        const netPerUnit = dprice / (1 + vat / 100);
+        totalVat = (dprice - netPerUnit) * dqty;
+        totalShip = ship;
+        totalInvoice = dprice * dqty + ship;
+        totalNetRevenue = netPerUnit * dqty;
+        grossProfit = totalNetRevenue - cogs;
+      }
     } else {
-      totalVat = dprice * vat / 100 * dqty;
-      totalInvoice = (dprice + dprice * vat / 100) * dqty;
-      totalShip = ship;
-      totalNetRevenue = (dprice - ship) * dqty;
-      grossProfit = totalNetRevenue - cogs;
+      if (!vatIncluded2) {
+        totalVat = dprice * vat / 100 * dqty;
+        totalInvoice = (dprice + dprice * vat / 100) * dqty;
+        totalShip = ship;
+        totalNetRevenue = (dprice - ship) * dqty;
+        grossProfit = totalNetRevenue - cogs;
+      } else {
+        const netPerUnit = dprice / (1 + vat / 100);
+        totalVat = (dprice - netPerUnit) * dqty;
+        totalShip = ship;
+        totalInvoice = dprice * dqty;
+        totalNetRevenue = (netPerUnit - ship) * dqty;
+        grossProfit = totalNetRevenue - cogs;
+      }
     }
     rec = {
       _id: editId||('user_'+Date.now()), year:yr, date, invoice, customer,
