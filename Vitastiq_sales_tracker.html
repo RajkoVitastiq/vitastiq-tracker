@@ -1750,7 +1750,27 @@ function updateSyncStatus() {
   }
 }
 
+// ── PASSWORD PROTECTION ──────────────────────────────────────────────────────
+// Current password: vitastiq2025
+const PASSWORD_HASH = 'dml0YXN0aXEyMDI1'; // = btoa('vitastiq2025')
+
+function checkPassword() {
+  const stored = sessionStorage.getItem('vt_auth');
+  if (stored === PASSWORD_HASH) return true;
+  const pwd = prompt('🔐 Vitastiq Sales Tracker\nUnesite lozinku:');
+  if (pwd === null) { document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#0f0f11;color:#e8e8ef;font-family:sans-serif;font-size:18px;">Pristup odbijen.</div>'; return false; }
+  const hash = btoa(pwd);
+  if (hash === PASSWORD_HASH) {
+    sessionStorage.setItem('vt_auth', PASSWORD_HASH);
+    return true;
+  } else {
+    document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#0f0f11;color:#f05252;font-family:sans-serif;font-size:18px;">❌ Pogrešna lozinka. Osvježi stranicu za ponovni pokušaj.</div>';
+    return false;
+  }
+}
+
 async function init() {
+  if (!checkPassword()) return;
   await loadExtra();
   await loadTargets();
   // Restore GSheet URL input
