@@ -660,7 +660,8 @@ function getYears() {
 // ─── STORAGE ─────────────────────────────────────────────────────────────────
 function seedKey(s) { return s.invoice + '|' + s.date + '|' + s.customer; }
 
-// ── STORAGE HELPERS (JSONP to bypass CORS) ───────────────────────────────────
+// ── STORAGE HELPERS ──────────────────────────────────────────────────────────
+// JSONP for GET requests (bypasses CORS for reads)
 function jsonpGet(url) {
   return new Promise((resolve) => {
     const cbName = 'cb_' + Date.now() + '_' + Math.round(Math.random()*1e6);
@@ -671,31 +672,29 @@ function jsonpGet(url) {
     };
     const s = document.createElement('script');
     s.id = cbName;
-    s.src = url + '&callback=' + cbName;
+    s.src = url + (url.includes('?') ? '&' : '?') + 'callback=' + cbName;
     s.onerror = () => { delete window[cbName]; s.remove(); resolve(null); };
     document.head.appendChild(s);
   });
 }
 
+// POST via no-cors (for writes — no response but data is saved)
+async function gsPost(data) {
+  if (!GSHEET_URL) return;
+  try {
+    await fetch(GSHEET_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+  } catch(e) {}
+}
+
 async function gsGet(key) {
   if (!GSHEET_URL) return null;
   try {
-    // Check if stored in chunks
-    const countUrl = GSHEET_URL + '?key=' + encodeURIComponent(key + '_count');
-    const countD = await jsonpGet(countUrl);
-    const count = countD && countD.value ? parseInt(countD.value) : 0;
-    if (count > 1) {
-      let assembled = '';
-      for (let i = 0; i < count; i++) {
-        const chunkUrl = GSHEET_URL + '?key=' + encodeURIComponent(key + '_' + i);
-        const chunkD = await jsonpGet(chunkUrl);
-        assembled += (chunkD && chunkD.value) ? chunkD.value : '';
-      }
-      return assembled ? decodeURIComponent(assembled) : null;
-    }
-    // Single value
-    const url = GSHEET_URL + '?key=' + encodeURIComponent(key);
-    const d = await jsonpGet(url);
+    const d = await jsonpGet(GSHEET_URL + '?key=' + encodeURIComponent(key));
     if (!d) return null;
     return d.value || null;
   } catch(e) { return null; }
@@ -704,54 +703,50 @@ async function gsGet(key) {
 async function gsSet(key, value) {
   // Always save to localStorage instantly
   localStorage.setItem(key, value);
-  // Also push to Google Sheets via JSONP GET with encoded value
+  // Save to Google Sheets via POST (no CORS issues, no URL length limit)
   if (!GSHEET_URL) return;
-  try {
-    // Split large values into chunks if needed (URL limit ~2000 chars)
-    const encoded = encodeURIComponent(value);
-    if (encoded.length > 1800) {
-      // Store in chunks: key_0, key_1, key_2... and key_count
-      const chunkSize = 1800;
-      const chunks = [];
-      for (let i = 0; i < encoded.length; i += chunkSize) {
-        chunks.push(encoded.slice(i, i + chunkSize));
-      }
-      // Store chunk count
-      await jsonpGet(GSHEET_URL + '?action=set&key=' + encodeURIComponent(key + '_count') + '&value=' + chunks.length);
-      // Store each chunk
-      for (let i = 0; i < chunks.length; i++) {
-        await jsonpGet(GSHEET_URL + '?action=set&key=' + encodeURIComponent(key + '_' + i) + '&value=' + chunks[i]);
-      }
-    } else {
-      const url = GSHEET_URL + '?action=set&key=' + encodeURIComponent(key) + '&value=' + encodeURIComponent(value);
-      await jsonpGet(url);
+  await gsPost({ key, value });
+}
+
+// Save all data at once in a single POST request
+async function gsSaveAll() {
+  if (!GSHEET_URL) return;
+  await gsPost({
+    batch: {
+      [STORE_KEY]: JSON.stringify(extraSales),
+      [DELETED_KEY]: JSON.stringify([...deletedSeedIds]),
+      [COGS_KEY]: JSON.stringify({cogs: cogsDefaults, prices: priceDefaults}),
+      [TARGETS_KEY]: JSON.stringify(targets)
     }
-  } catch(e) {}
+  });
 }
 
 async function loadExtra() {
-  // Try Google Sheets first, fall back to localStorage
-  const useGS = !!GSHEET_URL;
-  try {
-    const r = useGS ? await gsGet(STORE_KEY) : localStorage.getItem(STORE_KEY);
-    if (r) extraSales = JSON.parse(r);
-  } catch(e) {}
-  try {
-    const r2 = useGS ? await gsGet(DELETED_KEY) : localStorage.getItem(DELETED_KEY);
-    if (r2) deletedSeedIds = new Set(JSON.parse(r2));
-  } catch(e) {}
-  try {
-    const r3 = useGS ? await gsGet(COGS_KEY) : localStorage.getItem(COGS_KEY);
-    if (r3) { const s = JSON.parse(r3); cogsDefaults = s.cogs||s; priceDefaults = s.prices||priceDefaults; }
-  } catch(e) {}
-  try {
-    const r4 = useGS ? await gsGet(TARGETS_KEY) : localStorage.getItem(TARGETS_KEY);
-    if (r4) targets = JSON.parse(r4);
-  } catch(e) {}
+  if (GSHEET_URL) {
+    // Load all data at once from Google Sheets
+    try {
+      const d = await jsonpGet(GSHEET_URL);
+      if (d && d.data) {
+        if (d.data[STORE_KEY]) { try { extraSales = JSON.parse(d.data[STORE_KEY]); } catch(e) {} }
+        if (d.data[DELETED_KEY]) { try { deletedSeedIds = new Set(JSON.parse(d.data[DELETED_KEY])); } catch(e) {} }
+        if (d.data[COGS_KEY]) { try { const s = JSON.parse(d.data[COGS_KEY]); cogsDefaults = s.cogs||s; priceDefaults = s.prices||priceDefaults; } catch(e) {} }
+        if (d.data[TARGETS_KEY]) { try { targets = JSON.parse(d.data[TARGETS_KEY]); } catch(e) {} }
+        return;
+      }
+    } catch(e) {}
+  }
+  // Fallback: localStorage
+  try { const r = localStorage.getItem(STORE_KEY); if (r) extraSales = JSON.parse(r); } catch(e) {}
+  try { const r = localStorage.getItem(DELETED_KEY); if (r) deletedSeedIds = new Set(JSON.parse(r)); } catch(e) {}
+  try { const r = localStorage.getItem(COGS_KEY); if (r) { const s = JSON.parse(r); cogsDefaults = s.cogs||s; priceDefaults = s.prices||priceDefaults; } } catch(e) {}
+  try { const r = localStorage.getItem(TARGETS_KEY); if (r) targets = JSON.parse(r); } catch(e) {}
 }
 async function saveExtra() {
-  await gsSet(STORE_KEY, JSON.stringify(extraSales));
-  await gsSet(DELETED_KEY, JSON.stringify([...deletedSeedIds]));
+  // Save to localStorage instantly
+  localStorage.setItem(STORE_KEY, JSON.stringify(extraSales));
+  localStorage.setItem(DELETED_KEY, JSON.stringify([...deletedSeedIds]));
+  // Save everything to Google Sheets in one POST
+  await gsSaveAll();
 }
 
 // ─── FORMAT ──────────────────────────────────────────────────────────────────
@@ -1493,7 +1488,8 @@ async function saveCOGS() {
   cogsDefaults['Vitastiq Family'] = parseFloat(document.getElementById('cogs-family').value) || 50;
   priceDefaults['Vitastiq PRO'] = parseFloat(document.getElementById('price-pro').value) || 498;
   priceDefaults['Vitastiq Family'] = parseFloat(document.getElementById('price-family').value) || 258;
-  await gsSet(COGS_KEY, JSON.stringify({cogs: cogsDefaults, prices: priceDefaults}));
+  localStorage.setItem(COGS_KEY, JSON.stringify({cogs: cogsDefaults, prices: priceDefaults}));
+  await gsSaveAll();
   const saved = document.getElementById('cogs-saved');
   if (saved) { saved.style.display = ''; setTimeout(() => saved.style.display = 'none', 2500); }
 }
@@ -1555,7 +1551,8 @@ async function saveTargets() {
   for (let i=0;i<12;i++) {
     targets[yr][i] = parseFloat(document.getElementById(`tgt-${i}`)?.value)||0;
   }
-  await gsSet(TARGETS_KEY, JSON.stringify(targets));
+  localStorage.setItem(TARGETS_KEY, JSON.stringify(targets));
+  await gsSaveAll();
   renderTargets();
 }
 function copyTargetToAll() {
