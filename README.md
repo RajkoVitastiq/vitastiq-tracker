@@ -1,1 +1,0 @@
-# vitastiq-tracker
